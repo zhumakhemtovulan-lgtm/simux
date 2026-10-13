@@ -1,0 +1,226 @@
+// SIMUX — serverless AI endpoint (Vercel Node function)
+// Calls Google Gemini (free tier) and always returns JSON.
+// Env vars: GEMINI_API_KEY (required), GEMINI_MODEL (optional override)
+
+const FALLBACK_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-flash-latest",
+  "gemini-2.5-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemini-2.0-flash",
+];
+
+const clip = (v, n = 6000) => String(v ?? "").slice(0, n);
+
+const CRITERIA = `
+- "structure": Problem structuring (clear problem statement, MECE issue tree / framework fit to THIS case)
+- "insight": Use of data & insight prioritisation (uses the exhibits, quantifies, focuses on what drives the decision, ignores noise)
+- "logic": Logic & decision quality (recommendation follows from analysis, handles incomplete information with explicit assumptions)
+- "feasibility": Feasibility & implementation (realistic for Kazakhstan context, risks, KPIs, timeline, costs)
+- "communication": Communication & storyline (answer-first, concise, persuasive, a jury could follow it in 5 minutes)`;
+
+const PROMPTS = {
+  generate_case(p) {
+    return {
+      temperature: 1.0,
+      system:
+        "You are a senior case-championship author who writes business cases for student competitions in Kazakhstan and Central Asia (in the style of Big-4 / MBB / corporate case championships). You write realistic, specific, data-rich cases with FICTIONAL company names. Output strictly valid JSON, no markdown.",
+      user: `Write one new business case.
+Industry: ${clip(p.industry, 80)}
+Case type: ${clip(p.caseType, 80)}
+Difficulty: ${clip(p.difficulty, 40)} (Beginner = 2 exhibits, clear question; Intermediate = 3 exhibits, some noise; Advanced = 4 exhibits, conflicting signals, deliberately incomplete data)
+Time limit for the student: ${Number(p.minutes) || 30} minutes — size the case so it is solvable in that time.
+Context: Kazakhstan / Central Asia market, realistic numbers in KZT (use "KZT" and "mln"/"bn"), plausible but fictional company. Include at least one piece of irrelevant information and at least one important gap the student must handle with assumptions.
+
+Return JSON with exactly these keys:
+{
+ "title": "short catchy case title",
+ "company": "fictional company name",
+ "industry": "...",
+ "caseType": "...",
+ "hook": "one-sentence teaser",
+ "background": ["2-3 short paragraphs about the company and market"],
+ "situation": ["1-2 short paragraphs describing the current problem / trigger"],
+ "task": "the exact question the CEO asks the team, one or two sentences",
+ "deliverables": ["3-4 bullet deliverables the jury expects"],
+ "exhibits": [ {"title": "Exhibit 1: ...", "columns": ["..."], "rows": [["..."]], "note": "source / footnote"} ],
+ "answerKey": {
+   "keyInsights": ["4-6 insights a winning team would extract from the data"],
+   "strongRecommendation": "2-3 sentence outline of a strong answer (there may be several valid answers)",
+   "commonTraps": ["2-4 typical mistakes students make on this case"]
+ }
+}
+Exhibits: tables with 3-6 rows, numbers as strings. Keep total length under 700 words excluding the answerKey.`,
+    };
+  },
+
+  evaluate(p) {
+    const c = p.case || {};
+    const a = p.answers || {};
+    return {
+      temperature: 0.3,
+      system:
+        "You are the head of the jury at a top business case championship and an experienced consultant who coaches students. You grade honestly and specifically — never generic praise. Empty or one-line sections must receive low scores (1-3). You always explain WHY something is right or wrong, referencing the case data. Output strictly valid JSON, no markdown.",
+      user: `CASE
+Title: ${clip(c.title, 200)}
+Company: ${clip(c.company, 200)}
+Background: ${clip((c.background || []).join(" "), 3000)}
+Situation: ${clip((c.situation || []).join(" "), 2000)}
+Task: ${clip(c.task, 600)}
+Exhibits: ${clip(JSON.stringify(c.exhibits || []), 5000)}
+Jury notes (hidden from student): ${clip(JSON.stringify(c.answerKey || {}), 3000)}
+
+STUDENT SOLUTION (time used: ${Number(p.minutesUsed) || 0} of ${Number(p.minutesLimit) || 0} min, coach hints used: ${Number(p.hintsUsed) || 0})
+1. Problem definition: ${clip(a.problem, 2500) || "(empty)"}
+2. Structure / hypotheses: ${clip(a.structure, 3000) || "(empty)"}
+3. Analysis & key numbers: ${clip(a.analysis, 4000) || "(empty)"}
+4. Recommendation: ${clip(a.recommendation, 3000) || "(empty)"}
+5. Risks, KPIs & next steps: ${clip(a.risks, 2500) || "(empty)"}
+
+Score each criterion 1-10:${CRITERIA}
+"overall" = 0-100, consistent with the criteria scores (roughly their average x10, adjusted -5..+5 for time discipline and hint usage).
+
+Return JSON with exactly these keys:
+{
+ "overall": 0,
+ "verdict": "one sentence a jury chair would say",
+ "criteria": [ {"key": "structure", "name": "Problem structuring", "score": 0, "comment": "1-2 specific sentences"}, ... all 5 keys in the order structure, insight, logic, feasibility, communication ],
+ "strengths": ["2-3 specific strengths"],
+ "improvements": [ {"issue": "what was weak", "how": "concrete way to fix it next time"} ],
+ "missedInsights": ["insights from the data the student missed (empty array if none)"],
+ "modelSolution": {"summary": "answer-first summary of a strong solution", "structure": ["3-5 branch issue tree / storyline"], "recommendation": "what a winning team would recommend and why"},
+ "juryQuestions": ["3 tough, specific questions a jury would ask about THIS student's recommendation"],
+ "nextPractice": {"focus": "the single skill to train next", "why": "one sentence", "suggestedCaseType": "one of: Market entry, Profitability, Growth strategy, Pricing, New product launch, Digital transformation, Investment / M&A"}
+}
+Give 2-4 improvements.`,
+    };
+  },
+
+  coach(p) {
+    const c = p.case || {};
+    return {
+      temperature: 0.6,
+      system:
+        "You are a Socratic case-championship coach. You NEVER give the final answer or write the student's solution. You give one short, specific nudge that helps the student think, referencing the case. Output strictly valid JSON, no markdown.",
+      user: `Case: ${clip(c.title, 200)} — Task: ${clip(c.task, 600)}
+Exhibits: ${clip(JSON.stringify(c.exhibits || []), 3500)}
+The student is on step: ${clip(p.step, 80)}
+Their current notes for this step: ${clip(p.current, 2500) || "(empty)"}
+Their question (may be empty): ${clip(p.question, 500) || "(none)"}
+
+Return JSON: {"hint": "max 70 words, a concrete nudge (e.g. which exhibit/number to look at, which framework branch is missing)", "question": "one guiding question for the student"}`,
+    };
+  },
+
+  jury(p) {
+    const c = p.case || {};
+    const qa = Array.isArray(p.qa) ? p.qa.slice(0, 5) : [];
+    return {
+      temperature: 0.3,
+      system:
+        "You are a demanding but fair case-championship jury member evaluating a student's live Q&A answers. Be specific and practical. Output strictly valid JSON, no markdown.",
+      user: `Case: ${clip(c.title, 200)} — Task: ${clip(c.task, 600)}
+Student's recommendation: ${clip(p.recommendation, 2500) || "(empty)"}
+Q&A:
+${qa.map((x, i) => `Q${i + 1}: ${clip(x.q, 400)}\nA${i + 1}: ${clip(x.a, 1500) || "(no answer)"}`).join("\n")}
+
+Return JSON: {"ratings": [ {"score": 1-10, "feedback": "1-2 sentences", "betterAnswer": "a stronger 2-3 sentence answer"} ] (one per question, same order), "overallComment": "one sentence on how the student handles pressure"}`,
+    };
+  },
+};
+
+function parseJSON(text) {
+  let t = String(text || "").trim();
+  t = t.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+  try {
+    return JSON.parse(t);
+  } catch {
+    const s = t.indexOf("{");
+    const e = t.lastIndexOf("}");
+    if (s >= 0 && e > s) return JSON.parse(t.slice(s, e + 1));
+    throw new Error("AI returned invalid JSON");
+  }
+}
+
+async function callGemini(model, key, prompt, withThinkingOff) {
+  const generationConfig = {
+    temperature: prompt.temperature ?? 0.7,
+    responseMimeType: "application/json",
+  };
+  if (withThinkingOff) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const r = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: prompt.system }] },
+        contents: [{ role: "user", parts: [{ text: prompt.user }] }],
+        generationConfig,
+      }),
+    }
+  );
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error(j?.error?.message || `Gemini HTTP ${r.status}`);
+    err.status = r.status;
+    throw err;
+  }
+  const text = (j.candidates?.[0]?.content?.parts || [])
+    .map((x) => x.text || "")
+    .join("");
+  if (!text) {
+    const err = new Error("Empty AI response");
+    err.status = 502;
+    throw err;
+  }
+  return parseJSON(text);
+}
+
+export default async function handler(req, res) {
+  res.setHeader("Cache-Control", "no-store");
+  if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+
+  const key = process.env.GEMINI_API_KEY;
+  if (!key)
+    return res.status(500).json({ error: "Server is missing GEMINI_API_KEY. Add it in Vercel → Settings → Environment Variables and redeploy." });
+
+  let body = req.body;
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } catch { body = {}; }
+  }
+  const { action, payload } = body || {};
+  const build = PROMPTS[action];
+  if (!build) return res.status(400).json({ error: "Unknown action" });
+  const prompt = build(payload || {});
+
+  const models = process.env.GEMINI_MODEL
+    ? [process.env.GEMINI_MODEL, ...FALLBACK_MODELS]
+    : FALLBACK_MODELS;
+
+  let lastErr;
+  for (const model of models) {
+    const thinkingOff = model.startsWith("gemini-2.5");
+    try {
+      let data;
+      try {
+        data = await callGemini(model, key, prompt, thinkingOff);
+      } catch (e) {
+        if (thinkingOff && e.status === 400) data = await callGemini(model, key, prompt, false);
+        else throw e;
+      }
+      return res.status(200).json({ data, model });
+    } catch (e) {
+      lastErr = e;
+      // try next model on not-found / quota / overload / bad JSON
+      if ([400, 404, 429, 500, 502, 503, 504].includes(e.status) || !e.status) continue;
+      break;
+    }
+  }
+  const quota = lastErr?.status === 429;
+  return res.status(quota ? 429 : 502).json({
+    error: quota
+      ? "The free AI quota is busy right now. Please wait a minute and try again."
+      : `AI service error: ${lastErr?.message || "unknown"}`,
+  });
+}
